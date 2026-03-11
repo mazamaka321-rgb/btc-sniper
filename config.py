@@ -26,7 +26,9 @@ class Settings(BaseSettings):
 
     # Scan interval
     scan_interval_sec: int = 120  # scan every 2 minutes
-    price_update_sec: int = 60  # update BTC price every minute
+    price_update_sec: int = (
+        90  # update BTC price every 1.5 min (uses Coinbase/Binance fallback)
+    )
 
     # Web
     web_host: str = "0.0.0.0"

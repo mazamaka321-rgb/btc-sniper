@@ -16,6 +16,10 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Cached volatility (recalculated every ~15 min, not every request)
+_vol_cache: dict = {"daily_vol": 0.0, "annual_vol": 0.0, "prices": [], "ts": None}
+_VOL_CACHE_TTL = 900  # 15 minutes
+
 
 @dataclass
 class VolatilityData:
@@ -28,39 +32,110 @@ class VolatilityData:
     prices_30d: list[float]
 
 
-def fetch_btc_volatility() -> VolatilityData:
-    """Fetch current BTC price and calculate historical volatility."""
-    with httpx.Client(timeout=15) as client:
-        # Current price
-        r = client.get(
-            f"{settings.coingecko_url}/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd"},
-        )
-        r.raise_for_status()
-        current_price = r.json()["bitcoin"]["usd"]
+def _fetch_price_coingecko() -> float:
+    """Fetch BTC price from CoinGecko."""
+    r = httpx.get(
+        f"{settings.coingecko_url}/simple/price",
+        params={"ids": "bitcoin", "vs_currencies": "usd"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()["bitcoin"]["usd"]
 
-        # Historical prices for volatility
-        r2 = client.get(
+
+def _fetch_price_coinbase() -> float:
+    """Fetch BTC price from Coinbase (backup)."""
+    r = httpx.get(
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+        timeout=10,
+    )
+    r.raise_for_status()
+    return float(r.json()["data"]["amount"])
+
+
+def _fetch_price_binance() -> float:
+    """Fetch BTC price from Binance (backup)."""
+    r = httpx.get(
+        "https://api.binance.com/api/v3/ticker/price",
+        params={"symbol": "BTCUSDT"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return float(r.json()["price"])
+
+
+def fetch_btc_price() -> float:
+    """Fetch BTC price with fallback sources."""
+    sources = [
+        ("CoinGecko", _fetch_price_coingecko),
+        ("Coinbase", _fetch_price_coinbase),
+        ("Binance", _fetch_price_binance),
+    ]
+    for name, fn in sources:
+        try:
+            price = fn()
+            if price > 0:
+                return price
+        except Exception as e:
+            logger.warning("Price source %s failed: %s", name, e)
+    raise RuntimeError("All price sources failed")
+
+
+def _refresh_volatility_cache() -> None:
+    """Refresh historical volatility from CoinGecko (heavy request, cached)."""
+    now = datetime.now(tz=timezone.utc)
+    if _vol_cache["ts"] and (now - _vol_cache["ts"]).total_seconds() < _VOL_CACHE_TTL:
+        return
+
+    try:
+        r = httpx.get(
             f"{settings.coingecko_url}/coins/bitcoin/market_chart",
             params={
                 "vs_currency": "usd",
                 "days": str(settings.volatility_lookback_days),
             },
+            timeout=20,
         )
-        r2.raise_for_status()
-        prices = [p[1] for p in r2.json()["prices"]]
+        r.raise_for_status()
+        prices = [p[1] for p in r.json()["prices"]]
 
-    # Calculate log-return volatility (standard deviation)
-    log_returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
-    mean_r = sum(log_returns) / len(log_returns)
-    daily_vol = math.sqrt(
-        sum((r - mean_r) ** 2 for r in log_returns) / (len(log_returns) - 1)
-    )
+        log_returns = [
+            math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))
+        ]
+        mean_r = sum(log_returns) / len(log_returns)
+        daily_vol = math.sqrt(
+            sum((r - mean_r) ** 2 for r in log_returns) / (len(log_returns) - 1)
+        )
+        daily_vol *= settings.volatility_multiplier
 
-    # Apply multiplier for safety margin
-    daily_vol *= settings.volatility_multiplier
+        _vol_cache["daily_vol"] = daily_vol
+        _vol_cache["annual_vol"] = daily_vol * math.sqrt(365)
+        _vol_cache["prices"] = prices
+        _vol_cache["ts"] = now
+        logger.info(
+            "Volatility refreshed: daily=%.2f%% annual=%.1f%%",
+            daily_vol * 100,
+            _vol_cache["annual_vol"] * 100,
+        )
+    except Exception as e:
+        logger.warning("Volatility refresh failed: %s (using cached)", e)
+        if not _vol_cache["ts"]:
+            # First run, no cache — use conservative default volatility
+            logger.warning("No cached volatility, using default: 2.5%% daily")
+            _vol_cache["daily_vol"] = 0.025 * settings.volatility_multiplier
+            _vol_cache["annual_vol"] = _vol_cache["daily_vol"] * math.sqrt(365)
+            _vol_cache["prices"] = []
+            _vol_cache["ts"] = now
 
-    annual_vol = daily_vol * math.sqrt(365)
+
+def fetch_btc_volatility() -> VolatilityData:
+    """Fetch current BTC price + cached volatility. Lightweight — 1 API call."""
+    current_price = fetch_btc_price()
+    _refresh_volatility_cache()
+
+    daily_vol = _vol_cache["daily_vol"]
+    annual_vol = _vol_cache["annual_vol"]
+    prices = _vol_cache["prices"]
 
     logger.info(
         "BTC: $%.0f | Daily vol: %.2f%% | Annual vol: %.1f%%",
